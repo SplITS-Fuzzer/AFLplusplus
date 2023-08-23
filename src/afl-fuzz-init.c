@@ -776,7 +776,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
         if (afl->cmplog_lvl == 1) {
 
           if (!afl->cmplog_max_filesize ||
-              afl->cmplog_max_filesize < st.st_size) {
+              afl->cmplog_max_filesize > st.st_size) {
 
             afl->cmplog_max_filesize = st.st_size;
 
@@ -785,7 +785,7 @@ void read_testcases(afl_state_t *afl, u8 *directory) {
         } else if (afl->cmplog_lvl == 2) {
 
           if (!afl->cmplog_max_filesize ||
-              afl->cmplog_max_filesize > st.st_size) {
+              afl->cmplog_max_filesize < st.st_size) {
 
             afl->cmplog_max_filesize = st.st_size;
 

@@ -1637,12 +1637,12 @@ int main(int argc, char **argv_orig, char **envp) {
 
     if (afl->unicorn_mode) {
 
-      FATAL("CmpLog and Unicorn mode are not compatible at the moment, sorry");
+//      FATAL("CmpLog and Unicorn mode are not compatible at the moment, sorry");
 
     }
 
     if (!afl->fsrv.qemu_mode && !afl->fsrv.frida_mode &&
-        !afl->non_instrumented_mode) {
+        !afl->non_instrumented_mode && !afl->unicorn_mode) {
 
       check_binary(afl, afl->cmplog_binary);
 

@@ -400,7 +400,7 @@ struct afl_pass_stat {
 
   u8 total;
   u8 faileds;
-
+  u8 max_len;
 };
 
 struct foreign_sync {

@@ -63,8 +63,9 @@ struct cmp_operands {
 
 struct cmpfn_operands {
 
-  u8 v0[32];
-  u8 v1[32];
+  u8 v0[30];
+  u8 v1[30];
+  unsigned offset;
 
 };
 

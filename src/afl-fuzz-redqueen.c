@@ -64,6 +64,8 @@ struct range {
 
 };
 
+bool split_input = true;
+
 static struct range *add_range(struct range *ranges, u32 start, u32 end) {
 
   struct range *r = ck_alloc_nozero(sizeof(struct range));
@@ -150,7 +152,9 @@ static void type_replace(afl_state_t *afl, u8 *buf, u32 len) {
   u32 i;
   u8  c;
   for (i = 0; i < len; ++i) {
-
+    if(split_input){
+      c = rand_below(afl, 256);
+    } else {
     // wont help for UTF or non-latin charsets
     do {
 
@@ -233,6 +237,7 @@ static void type_replace(afl_state_t *afl, u8 *buf, u32 len) {
       }
 
     } while (c == buf[i]);
+    }
 
     buf[i] = c;
 
@@ -1882,6 +1887,111 @@ static u8 cmp_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
 
 }
 
+static const char terminators[6] = {',', ' ', ':', '\r', '\n', '\0'};
+static u8 split_its_rtn_try_terminate(afl_state_t* afl, u8 obs_idx, u8* buf, u32 fulllen, u32 len, struct cmp_map* map, u32 key, u32 log, u32 offset_idx, u8 repl, u8* status){
+  struct cmpfn_operands *o =
+        &((struct cmpfn_operands *)map->log[key])[log];
+
+  u8* pattern = o->v0;
+  for(u32 i=offset_idx; i<len; i++){
+    if(buf[i] == pattern[obs_idx]){
+      u8 old_byte = buf[i];
+      buf[i] = repl;
+      memset(afl->shm.cmp_map,0,sizeof(struct cmp_map));
+      afl->fsrv.total_execs++;
+      if(common_fuzz_cmplog_stuff(afl,buf,fulllen)){
+        return 1;
+      }
+      struct cmpfn_operands *newo =
+          &((struct cmpfn_operands *)afl->shm.cmp_map->log[key])[log];
+      if(repl == newo->v0[obs_idx]){
+        int res = 0;
+        for(int j=0;j<6;j++){
+          buf[i] = terminators[j];
+          res |= its_fuzz(afl, buf, fulllen, status);
+        }
+        buf[i] = old_byte;
+        return res;
+      }
+
+      if(*status == 1){
+        *status = 0;
+      }
+
+      // Nothing new, restore buffer
+      buf[i] = old_byte;
+
+    }
+  }
+  return 0;
+}
+
+static u8 split_its_rtn_fuzz_v2(afl_state_t* afl, u8 obs_idx, u8* buf, u32 fulllen, u32 len, struct cmp_map* map, u32 key, u32 log, u8 rlen, u32 offset_idx, bool try_terminate, u8* status, int buffer_offset){
+
+
+  struct cmpfn_operands *o =
+        &((struct cmpfn_operands *)map->log[key])[log];
+
+  u8* pattern = o->v0;
+  u8* repl = o->v1;
+
+  if(obs_idx >= rlen){
+    int res = 0;
+    fprintf(stderr, "Split run successful match\n");
+    res = its_fuzz(afl, buf, fulllen, status);
+    struct cmpfn_operands *newo =
+        &((struct cmpfn_operands *)afl->shm.cmp_map->log[key])[log];
+    fprintf(stderr, "Solved string with len %d: ", rlen);
+    for(int stringPos=0;stringPos<rlen;stringPos++){
+      fprintf(stderr,"%c",newo->v0[stringPos]);
+    }
+    fprintf(stderr, "\n");
+
+    if(try_terminate){
+      fprintf(stderr, "Split run attempting terminate\n");
+      res |= split_its_rtn_try_terminate(afl, obs_idx, buf, fulllen, len, map, key, log, offset_idx, 'a'+(pattern[obs_idx]=='a'), status);
+    }
+    return res;
+  }
+
+  for(u32 i=offset_idx; i<len; i++){
+    if(buf[i] == pattern[obs_idx+buffer_offset]){
+      // Optimise already solved byte case
+      if(pattern[obs_idx+buffer_offset] == repl[obs_idx])
+        return split_its_rtn_fuzz_v2(afl, obs_idx + 1, buf, fulllen, len, map, key, log, rlen, i + 1, try_terminate, status, buffer_offset);
+
+      u8 old_byte = buf[i];
+      buf[i] = repl[obs_idx];
+      memset(afl->shm.cmp_map,0,sizeof(struct cmp_map));
+      afl->fsrv.total_execs++;
+      if(common_fuzz_cmplog_stuff(afl,buf,fulllen)){
+        fprintf(stderr,"cmplog common returned 1");
+        return 1;
+      }
+      struct cmpfn_operands *newo =
+          &((struct cmpfn_operands *)afl->shm.cmp_map->log[key])[log];
+
+      if(memcmp(repl, (uint8_t*)(newo->v0)+buffer_offset, obs_idx+1) == 0){
+        if(split_its_rtn_fuzz_v2(afl, obs_idx + 1, buf, fulllen, len, map, key, log, rlen, i + 1, try_terminate, status, buffer_offset))
+          return 1;
+      }
+
+      if(*status == 1){
+        *status = 0;
+      }
+
+      // Nothing new, restore buffer
+      buf[i] = old_byte;
+
+    }
+  }
+  // Run it through with what we have before we exit, in case partial string helps (e.g. strncmp)
+  if(obs_idx > 0){
+    return its_fuzz(afl, buf, fulllen, status);
+  }
+  return 0;
+}
+
 static u8 rtn_extend_encoding(afl_state_t *afl, u8 *pattern, u8 *repl,
                               u8 *o_pattern, u8 *changed_val, u8 plen, u32 idx,
                               u32 taint_len, u8 *orig_buf, u8 *buf, u8 *cbuf,
@@ -2314,12 +2424,22 @@ static u8 rtn_extend_encoding(afl_state_t *afl, u8 *pattern, u8 *repl,
 
 }
 
+static bool is_printable(uint8_t c){
+  if(c > 126)
+    return false;
+  if(c > 31)
+    return true;
+  if(c == 9 || c == 10 || c == 13)
+    return true;
+  return false;
+}
+
 static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
                    u32 len, u8 lvl, struct tainted *taint) {
-
+  bool skip_extended_encoding = !split_input;
   struct tainted *   t;
   struct cmp_header *h = &afl->shm.cmp_map->headers[key];
-  u32                i, j, idx, have_taint = 1, taint_len, loggeds;
+  u32                i, j, idx, have_taint = !split_input, taint_len, loggeds;
   u8                 status = 0, found_one = 0;
 
   if (h->hits > CMP_MAP_RTN_H) {
@@ -2374,7 +2494,7 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
 
     }
 
-    for (idx = 0; idx < len; ++idx) {
+    for (idx = 0; idx < (len * !split_input) + split_input; ++idx) {
 
       if (have_taint) {
 
@@ -2416,6 +2536,92 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
       fprintf(stderr, "\n");
 #endif
 
+    if(split_input){
+      unsigned maxsearchlen = len;
+      if(maxsearchlen > o->offset)
+        maxsearchlen = o->offset;
+
+      int rom_len = 0, ram_len = 0;
+      for(int i=0; i<30; i++){
+        if(o->v0[i] == 0){
+          ram_len = i;
+          break;
+        }
+      }
+
+      for(int i=0; i<30; i++){
+        if(o->v1[i] == 0){
+          rom_len = i;
+          break;
+        }
+        if(!is_printable(o->v1[i])){ // Make sure flash content of string contains only printable chars
+          break;
+        }
+      }
+
+      int target_len;
+      bool should_terminate = false;
+
+      for(target_len=0; target_len<30; target_len++){
+        if(o->v0[target_len] == 0){
+          break;
+        }
+        if(o->v1[target_len] == 0){
+          should_terminate = true;
+          break;
+        }
+        if(!is_printable(o->v1[target_len])){ // Make sure flash content of string contains only printable chars
+          target_len = 0;
+          break;
+        }
+      }
+      if(rom_len < ram_len)
+        should_terminate = true;
+
+      target_len = rom_len;
+      if(ram_len < rom_len)
+        target_len = ram_len;
+
+      if(target_len > 1){
+        fprintf(stderr, "Hit %u/%u for idx %u, key %x, Got: %x %x %x %x %x %x %x %x %x %x %x %x, target %x %x %x %x. Current execs %llu. Offset %u of %u and string len %u\n", i, loggeds, idx, key, o->v0[0], o->v0[1], o->v0[2], o->v0[3], o->v0[4], o->v0[5], o->v0[6], o->v0[7], o->v0[8], o->v0[9], o->v0[10], o->v0[11], o->v1[0], o->v1[1], o->v1[2], o->v1[3], afl->fsrv.total_execs, o->offset, len, target_len);
+        u64 orig_hit_cnt, new_hit_cnt;
+
+        orig_hit_cnt = afl->queued_paths + afl->unique_crashes;
+        struct cmp_map* saved_map = malloc(sizeof(struct cmp_map));
+        memcpy(saved_map, afl->shm.cmp_map, sizeof(struct cmp_map));
+        if (unlikely(split_its_rtn_fuzz_v2(afl, 0, buf, len, maxsearchlen, saved_map, key, i, target_len, 0, should_terminate, &status, 0))) {
+          free(saved_map);
+          return 1;
+        }
+        if(ram_len > rom_len){
+          if (unlikely(split_its_rtn_fuzz_v2(afl, 0, buf, len, maxsearchlen, saved_map, key, i, target_len, 0, false, &status, ram_len - rom_len))) {
+            free(saved_map);
+            return 1;
+          }
+        }
+        memcpy(afl->shm.cmp_map, saved_map, sizeof(struct cmp_map));
+        free(saved_map);
+        new_hit_cnt = afl->queued_paths + afl->unique_crashes;
+        if(new_hit_cnt != orig_hit_cnt){
+          status = 1;
+        } else {
+          status = 2;
+        }
+        if (status == 1){
+          fprintf(stderr, "Split solve success on hit %u, execs now: %llu\n", i, afl->fsrv.total_execs);
+        }
+      } else {
+        fprintf(stderr, "Skipping rq attempt with key %x on string %s (len %d) due to short buffer string (len %d)\n", key, o->v1, strlen(o->v1), target_len);
+      }
+    }
+
+    if (status == 1) {
+      found_one = 1;
+      break;
+    }
+
+    if(!skip_extended_encoding){
+
       if (unlikely(rtn_extend_encoding(
               afl, o->v0, o->v1, orig_o->v0, orig_o->v1, SHAPE_BYTES(h->shape),
               idx, taint_len, orig_buf, buf, cbuf, len, lvl, &status))) {
@@ -2449,9 +2655,10 @@ static u8 rtn_fuzz(afl_state_t *afl, u32 key, u8 *orig_buf, u8 *buf, u8 *cbuf,
       }
 
     }
+    }
 
     // If failed, add to dictionary
-    if (!found_one && (lvl & LVL1)) {
+    if (!found_one && (lvl & LVL1) && !split_input) {
 
       if (unlikely(!afl->pass_stats[key].total)) {
 
@@ -2617,6 +2824,52 @@ u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
     if (!afl->shm.cmp_map->headers[k].hits) { continue; }
 
+    if(afl->shm.cmp_map->headers[k].type != CMP_TYPE_INS) {
+      int loggeds, max_target_len = 0, max_log = 0;
+      struct cmp_header *h = &afl->shm.cmp_map->headers[k];
+
+      if (h->hits > CMP_MAP_RTN_H) {
+        loggeds = CMP_MAP_RTN_H;
+      } else {
+        loggeds = h->hits;
+      }
+
+
+
+      for (int i = 0; i < loggeds; ++i) {
+        struct cmpfn_operands *o =
+            &((struct cmpfn_operands *)afl->shm.cmp_map->log[k])[i];
+
+        int target_len;
+        for(target_len=0; target_len<30; target_len++){
+          if(o->v0[target_len] == 0 || o->v1[target_len] == 0)
+            break;
+          if(!is_printable(o->v1[target_len])){
+            target_len = 0;
+            break;
+          }
+        }
+        if(target_len>max_target_len){
+          max_target_len = target_len;
+          max_log = i;
+        }
+      }
+
+      if(max_target_len > afl->pass_stats[k].max_len && (afl->pass_stats[k].faileds || afl->pass_stats[k].total)){ // Reset totals if length has increased. Prior buffer was likely too small
+        struct cmpfn_operands *ostring =
+            &((struct cmpfn_operands *)afl->shm.cmp_map->log[k])[max_log];
+
+        fprintf(stderr, "Resetting counts from %hhu, %hhu for string solving on key %x. Len %d -> %d. Target string: ",afl->pass_stats[k].faileds,afl->pass_stats[k].total,k,afl->pass_stats[k].max_len, max_target_len);
+        for(int j=0;j<max_target_len;j++){
+          fprintf(stderr,"%c",ostring->v1[j]);
+        }
+        fprintf(stderr, "\n");
+        afl->pass_stats[k].max_len = max_target_len;
+        afl->pass_stats[k].faileds = 1;
+        afl->pass_stats[k].total = 1;
+      }
+    }
+
     if (afl->pass_stats[k].faileds >= CMPLOG_FAIL_MAX ||
         afl->pass_stats[k].total >= CMPLOG_FAIL_MAX) {
 
@@ -2645,6 +2898,7 @@ u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   for (k = 0; k < CMP_MAP_W; ++k) {
 
     if (!afl->shm.cmp_map->headers[k].hits) { continue; }
+
 
 #if defined(_DEBUG) || defined(CMPLOG_INTROSPECTION)
     ++cmp_locations;
