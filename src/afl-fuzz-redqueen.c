@@ -1926,7 +1926,7 @@ static u8 split_its_rtn_try_terminate(afl_state_t* afl, u8 obs_idx, u8* buf, u32
   return 0;
 }
 
-static u8 split_its_rtn_fuzz_v2(afl_state_t* afl, u8 obs_idx, u8* buf, u32 fulllen, u32 len, struct cmp_map* map, u32 key, u32 log, u8 rlen, u32 offset_idx, bool try_terminate, u8* status, int buffer_offset){
+u8 split_its_rtn_fuzz_v2(afl_state_t* afl, u8 obs_idx, u8* buf, u32 fulllen, u32 len, struct cmp_map* map, u32 key, u32 log, u8 rlen, u32 offset_idx, bool try_terminate, u8* status, int buffer_offset){
 
 
   struct cmpfn_operands *o =

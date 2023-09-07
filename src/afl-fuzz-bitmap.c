@@ -28,7 +28,7 @@
 #if !defined NAME_MAX
   #define NAME_MAX _XOPEN_NAME_MAX
 #endif
-
+#include "cmplog.h"
 /* Write bitmap to file. The bitmap is useful mostly for the secret
    -B option, to focus a separate fuzzing session on a particular
    interesting input without rediscovering all the others. */
@@ -450,6 +450,18 @@ void write_crash_readme(afl_state_t *afl) {
 
 }
 
+static bool is_printable(uint8_t c){
+  if(c > 126)
+    return false;
+  if(c > 31)
+    return true;
+  if(c == 9 || c == 10 || c == 13)
+    return true;
+  return false;
+}
+
+extern u8 split_its_rtn_fuzz_v2(afl_state_t* afl, u8 obs_idx, u8* buf, u32 fulllen, u32 len, struct cmp_map* map, u32 key, u32 log, u8 rlen, u32 offset_idx, bool try_terminate, u8* status, int buffer_offset);
+
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -768,6 +780,135 @@ save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
       afl->last_crash_time = get_cur_time();
       afl->last_crash_execs = afl->fsrv.total_execs;
+
+      // SplITS On Crash
+//#define SPLITS_ON_CRASH
+#ifdef SPLITS_ON_CRASH
+      fprintf(stderr,"Starting SplITS on crash data\n");
+      uint8_t* old_cmp_map = malloc(sizeof(struct cmp_map));
+      uint8_t* old_test_case = malloc(len);
+      memcpy(old_test_case, mem, len);
+      memcpy(old_cmp_map, afl->shm.cmp_map, sizeof(struct cmp_map));
+      memset(afl->shm.cmp_map->headers, 0, sizeof(struct cmp_header) * CMP_MAP_W);
+      if (unlikely(common_fuzz_cmplog_stuff(afl, mem, len))) {
+        break;
+      }
+      int key = 0, i = 0;
+      for (key = 0; key < CMP_MAP_W; ++key) {
+
+      if (!afl->shm.cmp_map->headers[key].hits) { continue; }
+
+
+      if (afl->shm.cmp_map->headers[key].type == CMP_TYPE_RTN) {
+
+      struct cmp_header *h = &afl->shm.cmp_map->headers[key];
+      u32                loggeds;
+
+      if (afl->pass_stats[key].total > 3) {
+        fprintf(stderr, "Skipping key %d due to having seen it before\n");
+        continue; // Skip ones we already fuzz in non-crashing inputs
+      }
+
+      if (h->hits > CMP_MAP_RTN_H) {
+        loggeds = CMP_MAP_RTN_H;
+      } else {
+        loggeds = h->hits;
+      }
+
+      for (i = 0; i < loggeds; ++i) {
+
+      struct cmpfn_operands *o =
+            &((struct cmpfn_operands *)afl->shm.cmp_map->log[key])[i];
+
+      u8 status = 0;
+      unsigned maxsearchlen = len;
+      if(maxsearchlen > o->offset)
+        maxsearchlen = o->offset;
+
+      int rom_len = 0, ram_len = 0;
+      for(int b=0; b<30; b++){
+        if(o->v0[b] == 0){
+          ram_len = b;
+          break;
+        }
+      }
+
+      for(int b=0; b<30; b++){
+        if(o->v1[b] == 0){
+          rom_len = b;
+          break;
+        }
+        if(!is_printable(o->v1[b])){ // Make sure flash content of string contains only printable chars
+          break;
+        }
+      }
+
+      int target_len;
+      bool should_terminate = false;
+
+      for(target_len=0; target_len<30; target_len++){
+        if(o->v0[target_len] == 0){
+          break;
+        }
+        if(o->v1[target_len] == 0){
+          should_terminate = true;
+          break;
+        }
+        if(!is_printable(o->v1[target_len])){ // Make sure flash content of string contains only printable chars
+          target_len = 0;
+          break;
+        }
+      }
+
+      if(rom_len < ram_len)
+        should_terminate = true;
+
+      target_len = rom_len;
+      if(ram_len < rom_len)
+        target_len = ram_len;
+
+      if(target_len > 1){
+        u64 orig_hit_cnt, new_hit_cnt;
+
+        orig_hit_cnt = afl->queued_paths + afl->unique_crashes;
+        struct cmp_map* saved_map = malloc(sizeof(struct cmp_map));
+        memcpy(saved_map, afl->shm.cmp_map, sizeof(struct cmp_map));
+        if (unlikely(split_its_rtn_fuzz_v2(afl, 0, mem, len, maxsearchlen, saved_map, key, i, target_len, 0, should_terminate, &status, 0))) {
+          free(saved_map);
+          goto end_splits_crash;
+        }
+        if(ram_len > rom_len){
+          if (unlikely(split_its_rtn_fuzz_v2(afl, 0, mem, len, maxsearchlen, saved_map, key, i, target_len, 0, false, &status, ram_len - rom_len))) {
+            free(saved_map);
+            goto end_splits_crash;
+          }
+        }
+        memcpy(afl->shm.cmp_map, saved_map, sizeof(struct cmp_map));
+        free(saved_map);
+        new_hit_cnt = afl->queued_paths + afl->unique_crashes;
+        if(new_hit_cnt != orig_hit_cnt){
+          status = 1;
+        } else {
+          status = 2;
+        }
+        if (status == 1){
+          fprintf(stderr, "Split solve success on hit %u, execs now: %llu\n", i, afl->fsrv.total_execs);
+        }
+      } else {
+        fprintf(stderr, "Skipping rq attempt with key %x on string %s (len %d) due to short buffer string (len %d)\n", key, o->v1, strlen(o->v1), target_len);
+      }
+      }
+      }
+      }
+
+end_splits_crash:
+      memcpy(mem, old_test_case, len);
+      memcpy(afl->shm.cmp_map, old_cmp_map, sizeof(struct cmp_map));
+      free(old_test_case);
+      free(old_cmp_map);
+      fprintf(stderr,"SplITS on Crash Complete\n");
+#endif
+      // End SplITS on Crash
 
       break;
 
